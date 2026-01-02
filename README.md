@@ -3,8 +3,8 @@
 This Python toolkit exploits Next.js React Server Components (RSC) prototype pollution + React.lazy(-1) gadget chain for full RCE access, including interactive god shell, file upload (PHP webshell dropper), and exfiltration via `?out=`.
 
 ## **Image Preview**
-[![Pwned](https://github.com/khadafigans/React2Shell/raw/main/pwned.jpg)
-[![Terminal](https://github.com/khadafigans/React2Shell/raw/main/terminal.jpg)
+![Pwned](https://github.com/khadafigans/React2Shell/raw/main/pwned.jpg)
+![Terminal](https://github.com/khadafigans/React2Shell/raw/main/terminal.jpg)
 
 ## 🧾 main.py
 ### 📌 Purpose
