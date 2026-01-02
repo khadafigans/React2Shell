@@ -47,7 +47,7 @@ def print_banner():
 {Colors.RESET}
     """
     print(banner)
-    print(f"{Colors.DARK_GREEN}Loaded all original react.py payloads with WAF bypass. Ready to own everything.{Colors.RESET}\n")
+    print(f"{Colors.DARK_GREEN}System online, Welcome Administrator!. Ready to own everything.{Colors.RESET}\n")
 
 def normalize_url(url: str) -> str:
     """Normalize URL - handles domain.com, http://, https://"""
