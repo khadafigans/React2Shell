@@ -8,7 +8,7 @@ This Python toolkit exploits Next.js React Server Components (RSC) prototype pol
 
 ## 🧾 main.py
 ### 📌 Purpose
-Automated detection & exploitation of vulnerable Next.js apps (e.g., invoices.my.id). Drops uid=33(www-data) shell with:
+Automated detection & exploitation of vulnerable Next.js apps (e.g., target.com). Drops uid=33(www-data) shell with:
 - RCE via `child_process.execSync` → `/exploit?out=UID`
 - God Shell: Interactive cmds, file read (`read /etc/passwd`), uploads
 - Bypass: Junk KB padding, Unicode, Vercel/WAF tweaks
@@ -24,7 +24,7 @@ Automated detection & exploitation of vulnerable Next.js apps (e.g., invoices.my
 ### 📥 Usage
 1. `pip3 install aiohttp`
 2. `python3 main.py`
-3. Enter target(s): `http://invoices.my.id` or `targets.txt`
+3. Enter target(s): `http://target.com` or `targets.txt`
 4. Mode: `1=Detect 2=PoC(id) 3=Custom 4=God Shell [4]`
 
 **Piped**: `echo \"http://target\n4\" | python3 main.py`
