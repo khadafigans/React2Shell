@@ -635,38 +635,38 @@ async def process_target(session, url, waf_bypass, waf_bypass_size_kb, unicode_e
 
     found_items = []
     if results['db']:
-        with open(output_files['db'], 'a') as f:
+        with open(output_files['db'], 'a', encoding='utf-8') as f:
             for item in results['db']: f.write(format_db_output(item))
         found_items.append(f"{Colors.CYAN}DATABASE{Colors.RESET}")
         async with lock: stats['db'] += len(results['db'])
     
     if results['stripe']:
-        with open(output_files['stripe'], 'a') as f:
+        with open(output_files['stripe'], 'a', encoding='utf-8') as f:
             for item in results['stripe']: f.write(format_stripe_output(item))
         found_items.append(f"{Colors.MAGENTA}STRIPE{Colors.RESET}")
         async with lock: stats['stripe'] += len(results['stripe'])
         
     if results['twilio']:
-        with open(output_files['twilio'], 'a') as f:
+        with open(output_files['twilio'], 'a', encoding='utf-8') as f:
             for item in results['twilio']: f.write(format_twilio_output(item))
         found_items.append(f"{Colors.BLUE}TWILIO{Colors.RESET}")
         async with lock: stats['twilio'] += len(results['twilio'])
         
     if results['ai']:
-        with open(output_files['ai'], 'a') as f:
+        with open(output_files['ai'], 'a', encoding='utf-8') as f:
             for item in results['ai']: 
                 f.write(format_ai_key_output(item))
                 found_items.append(f"{Colors.GREEN}{item['type']}{Colors.RESET}")
         async with lock: stats['ai'] += len(results['ai'])
         
     if results['ses']:
-        with open(output_files['ses'], 'a') as f:
+        with open(output_files['ses'], 'a', encoding='utf-8') as f:
             for item in results['ses']: f.write(format_ses_output(item))
         found_items.append(f"{Colors.AMBER}AWS-SES{Colors.RESET}")
         async with lock: stats['ses'] += len(results['ses'])
         
     if results['smtp']:
-        with open(output_files['smtp'], 'a') as f:
+        with open(output_files['smtp'], 'a', encoding='utf-8') as f:
             for item in results['smtp']: f.write(format_smtp_output(item))
         found_items.append(f"{Colors.DARK_GREEN}SMTP{Colors.RESET}")
         async with lock: stats['smtp'] += len(results['smtp'])
@@ -736,7 +736,7 @@ async def main():
         os.makedirs(output_dir, exist_ok=True)
         skip_urls = None
     
-    with open(target_input) as f:
+    with open(target_input, encoding='utf-8') as f:
         targets = [l.strip() for l in f if l.strip() and not l.startswith('#')]
     
     checkpoint_state.update({'target_file': target_input, 'output_dir': output_dir, 'waf_bypass': waf_bypass, 'waf_bypass_size_kb': waf_bypass_size_kb, 'unicode_encode': unicode_encode})
@@ -748,7 +748,7 @@ async def main():
     }
     
     if not skip_urls:
-        for fpath in output_files.values(): open(fpath, 'w').close()
+        for fpath in output_files.values(): open(fpath, 'w', encoding='utf-8').close()
     
     print(f"{Colors.CYAN}[*] Loaded {len(targets)} targets{Colors.RESET}")
     print(f"\n{Colors.CYAN}[*] Output directory: {output_dir}/{Colors.RESET}")
